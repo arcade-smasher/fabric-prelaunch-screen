@@ -1,0 +1,20 @@
+{
+  "mappings": {
+    "com/arcadesmasher/prelaunch/mixin/BootstrapMixin": {
+      "initialize": "Lnet/minecraft/class_2966;method_12851()V"
+    },
+    "com/arcadesmasher/prelaunch/mixin/SimpleRegistryMixin": {
+      "Lnet/minecraft/registry/MutableRegistry;add(Lnet/minecraft/registry/RegistryKey;Ljava/lang/Object;Lnet/minecraft/registry/entry/RegistryEntryInfo;)Lnet/minecraft/registry/entry/RegistryEntry$Reference;": "Lnet/minecraft/class_2370;method_10272(Lnet/minecraft/class_5321;Ljava/lang/Object;Lnet/minecraft/class_9248;)Lnet/minecraft/class_6880$class_6883;"
+    }
+  },
+  "data": {
+    "named:intermediary": {
+      "com/arcadesmasher/prelaunch/mixin/BootstrapMixin": {
+        "initialize": "Lnet/minecraft/class_2966;method_12851()V"
+      },
+      "com/arcadesmasher/prelaunch/mixin/SimpleRegistryMixin": {
+        "Lnet/minecraft/registry/MutableRegistry;add(Lnet/minecraft/registry/RegistryKey;Ljava/lang/Object;Lnet/minecraft/registry/entry/RegistryEntryInfo;)Lnet/minecraft/registry/entry/RegistryEntry$Reference;": "Lnet/minecraft/class_2370;method_10272(Lnet/minecraft/class_5321;Ljava/lang/Object;Lnet/minecraft/class_9248;)Lnet/minecraft/class_6880$class_6883;"
+      }
+    }
+  }
+}

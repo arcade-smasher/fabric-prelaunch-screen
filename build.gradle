@@ -4,6 +4,8 @@ plugins {
 }
 
 version = project.mod_version
+description = project.mod_description
+mod_name = project.mod_name
 group = project.maven_group
 
 base {
@@ -15,7 +17,6 @@ repositories {
 
 // build with specific version, like `./gradlew build -PmcVersion=1.20.5`
 def mcVersion = project.findProperty("mcVersion") ?: "1.20.5"
-println "Building for Minecraft ${mcVersion}"
 
 ext {
 	versionSourceDir = "src/v${mcVersion.replace('.', '_')}"
@@ -47,10 +48,17 @@ sourceSets {
 }
 
 processResources {
-	inputs.property "version", project.version
-	filesMatching("fabric.mod.json") {
-		expand "version": inputs.properties.version
-	}
+    def props = [
+        version: project.version,
+        description: project.description,
+        name: project.mod_name
+    ]
+
+    inputs.properties(props)
+
+    filesMatching("fabric.mod.json") {
+        expand(props)
+    }
 }
 
 tasks.withType(JavaCompile).configureEach {
