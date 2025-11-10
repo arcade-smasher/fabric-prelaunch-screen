@@ -1,0 +1,33 @@
+{
+	"schemaVersion": 1,
+	"id": "prelaunch",
+	"version": "${version}",
+	"name": "Prelaunch Loading Screen",
+	"description": "A prelaunch loading screen intended to be similar to Forge's.",
+	"authors": [
+		"Arcadesmasher"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "MIT",
+	"icon": "assets/prelaunch/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"preLaunch": [
+			"com.arcadesmasher.prelaunch.PreLaunch"
+		],
+		"main": [
+			"com.arcadesmasher.prelaunch.Initializer"
+		]
+	},
+	"mixins": [
+		"prelaunch.mixins.json"
+	],
+	"depends": {
+		"fabricloader": ">=0.8.9",
+		"minecraft": ">=1.19.3 <=1.20.4",
+		"java": ">=8"
+	}
+}

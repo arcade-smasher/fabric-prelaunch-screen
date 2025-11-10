@@ -1,0 +1,16 @@
+{
+	"required": true,
+	"package": "com.arcadesmasher.prelaunch.mixin",
+	"compatibilityLevel": "JAVA_8",
+	"mixins": [
+		"GLFWMixin",
+		"BootstrapMixin",
+		"SimpleRegistryMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}
