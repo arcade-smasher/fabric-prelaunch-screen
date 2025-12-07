@@ -117,6 +117,7 @@ public class MinecraftBitmapFont {
 			return string;
 		}
 
+		// Update the text to be rendered. Only call this when the text changes, NOT every frame.
 		public void update(String text) {
 			if (string == text) return;
 			string = text;
@@ -126,7 +127,7 @@ public class MinecraftBitmapFont {
 
 			for (int i = 0, len = text.length(); i < len; i++) {
 				char c = text.charAt(i);
-				Character bCharacter = (c >= asciiStart && c < asciiEnd + 1) ? charCache[c - asciiStart] : charCache[c - fallbackIndex];
+				Character bCharacter = (c >= asciiStart && c < asciiEnd + 1) ? charCache[c - asciiStart] : charCache[c - fallbackIndex]; // Looks weird, just checks for OOB character and uses fallback
 				cachedCharacters[i] = bCharacter;
 				w += bCharacter.width + 1;
 			}
@@ -138,6 +139,7 @@ public class MinecraftBitmapFont {
 			width = w;
 		}
 
+		// Render the text at the given position and scale without a maximum width (no line wrapping). It's faster than the other render method, so prioritize this when possible.
 		public void render(float x, float y, float scale) {
 			float currentX = x;
 
@@ -147,6 +149,7 @@ public class MinecraftBitmapFont {
 			}
 		}
 
+		// Render the text at the given position and scale, wrapping lines at maxWidth. It does not wrap characters, only words, so don't use it for single words.
 		public void render(float x, float y, float maxWidth, float scale) {
 			float currentX = x;
 			float currentY = y;
@@ -167,6 +170,7 @@ public class MinecraftBitmapFont {
 		}
 	}
 
+	// Precompute glyph data once and then call render on it multiple times
 	private class Character {
 		public final int width;
 		public final int height = charHeight;
@@ -178,6 +182,7 @@ public class MinecraftBitmapFont {
 		public final float vMax;
 
 		public Character(char c) {
+			// If character is out of bounds, use placeholder/fallback attributes
 			if (c < asciiStart || c > asciiEnd) {
 				width = 5;
 				realWidth = 5;
@@ -209,6 +214,8 @@ public class MinecraftBitmapFont {
 				}
 				if (pixelWidth > 0) break;
 			}
+
+			// If 0 width, it's a space or invisible character, and obviously just leaving it at 0 looks weird, so we set it to 5
 			if (pixelWidth == 0) {
 				visible = false;
 				pixelWidth = 5; // 5 is default width for space character
@@ -237,35 +244,6 @@ public class MinecraftBitmapFont {
 			GL11.glTexCoord2f(uMin, vMax); GL11.glVertex2f(x, y + charHeight*scale);
 			GL11.glEnd();
 			GL11.glPopAttrib();
-		}
-	}
-
-	public void drawString(String text, float x, float y, float scale) {
-		float currentX = x;
-		int fallbackIndex = asciiEnd + 1;
-
-		for (int i = 0, len = text.length(); i < len; i++) {
-			char c = text.charAt(i);
-			Character bCharacter = (c >= asciiStart && c < asciiEnd + 1) ? charCache[c - asciiStart] : charCache[fallbackIndex];
-			bCharacter.render(currentX, y, scale);
-			currentX += bCharacter.width * scale + scale;
-		}
-	}
-
-	public void drawString(String text, float x, float y, float maxWidth, float scale) {
-		float currentX = x;
-		float currentY = y;
-
-		for (String word : text.split(" ")) {
-			Text wordText = new Text(word);
-			float wordWidth = wordText.width() * scale;
-			if (currentX + wordWidth > maxWidth) {
-				currentX = x;
-				currentY += charHeight + lineGap * scale;
-			}
-			charCache[0].render(currentX + wordWidth, currentY, scale);
-			wordText.render(currentX, currentY, scale);
-			currentX += wordWidth + charCache[0].width * scale;
 		}
 	}
 }

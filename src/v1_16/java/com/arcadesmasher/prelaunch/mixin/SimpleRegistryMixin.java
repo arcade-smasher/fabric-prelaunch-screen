@@ -19,7 +19,7 @@ public abstract class SimpleRegistryMixin<T> {
         require = 0
     )
     private void onAdd(RegistryKey<T> key, T value, CallbackInfoReturnable<T> cir) {
-        if (!PreLaunch.running) return;
+        if (!PreLaunch.resourcesInitialized) return;
         PreLaunch.detailedStatus.update("Registering " + key.getValue());
     }
 }

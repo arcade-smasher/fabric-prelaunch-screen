@@ -13,20 +13,23 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.Semaphore;
 
+// should probably separate rendering and window management into another class at some point
 public class PreLaunch implements PreLaunchEntrypoint {
 
     private static final Logger LOGGER = new Logger("loading-window");
 
     private static final AtomicReference<Long> windowRef = new AtomicReference<>(null);
-    private static Thread glfwThread;
-    private static Thread renderThread;
-    private static final Object threadLock = new Object();
-    private static final ScheduledExecutorService scheduler = Executors.newScheduledThreadPool(1);
+    private static ScheduledExecutorService renderScheduler;
+    private static ScheduledFuture<?> renderTick;
+    private static final Semaphore renderLock = new Semaphore(1);
 
     public static volatile boolean running = false;
+    public static volatile boolean resourcesInitialized = false;
     public static volatile boolean showDetailedStatus = false;
 
     private static MinecraftBitmapFont font;
@@ -43,13 +46,18 @@ public class PreLaunch implements PreLaunchEntrypoint {
     private static final Color BACKGROUND_COLOR = new Color(239, 50, 61, 1f);
     private static final Color FOREGROUND_COLOR = new Color(255, 255, 255, 1f);
 
+    private static int frame = 0;
+    private static Runtime runtime;
+    private static long maxMemory;
+    private static MinecraftBitmapFont.Text memoryText;
+    private static float[] memoryUsed = new float[1];
+    private static MinecraftBitmapFont.Text versionInfoText;
+    private static MinecraftBitmapFont.Text fabricVersionInfoText;
+    private static int detailedStatusFrame = -1;
+
     @Override
     public void onPreLaunch() {
         LOGGER.info("PRELOAD");
-        if (isMac()) {
-            LOGGER.warn("Skipping GLFW early loading screen on macOS (context restrictions).");
-            return;
-        }
         try {
             startWindow();
         } catch (Exception e) {
@@ -58,40 +66,42 @@ public class PreLaunch implements PreLaunchEntrypoint {
     }
 
     private void startWindow() {
-        if (glfwThread != null && glfwThread.isAlive()) return;
+        // initialize GLFW on the main thread !!! important
+        GLFWErrorCallback.createPrint(System.err).set();
+        if (!GLFW.glfwInit()) {
+            LOGGER.error("GLFW failed to initialize!");
+            return;
+        }
 
-        glfwThread = new Thread(() -> {
-            GLFWErrorCallback.createPrint(System.err).set();
-            if (!GLFW.glfwInit()) {
-                LOGGER.error("GLFW failed to initialize!");
-                return;
-            }
+        try {
+            // create window on MAIN THREAD!!
+            long windowID = createWindow();
+            if (windowID == MemoryUtil.NULL) return;
 
-            try {
-                long windowID = createWindow();
-                if (windowID == MemoryUtil.NULL) return;
+            windowRef.set(windowID);
+            running = true;
 
-                initGL(windowID);
-                loadFont();
+            // start render thread
+            renderScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+                final Thread thread = Executors.defaultThreadFactory().newThread(r); // it might potentially be possible for this to return something other than a Thread.
+                thread.setDaemon(true);
+                thread.setName("prelaunch-render-thread");
+                return thread;
+            });
 
-                running = true;
-                renderLoop(windowID);
+            // init rendering on render thread
+            renderScheduler.submit(() -> initGL(windowID));
 
-                scheduler.shutdownNow();
-                disposeResources();
+            // periodic rendering, ~20 FPS
+            renderTick = renderScheduler.scheduleAtFixedRate(() -> renderThreadFunc(windowID), 50, 50, TimeUnit.MILLISECONDS);
 
-            } finally {
-                cleanupWindow();
-                GLFW.glfwSetErrorCallback(null).free();
-                running = false;
-                synchronized (threadLock) {
-                    glfwThread = null;
-                }
-            }
-        }, "prelaunch-glfw-thread");
+            // mem display updates, can and should be less frequent than rendering to not tax the JVM too much
+            renderScheduler.scheduleAtFixedRate(PreLaunch::updateMemory, 500, 500, TimeUnit.MILLISECONDS);
 
-        glfwThread.setDaemon(true);
-        glfwThread.start();
+        } catch (Exception e) {
+            LOGGER.error("Failed during window setup", e);
+            cleanupWindow();
+        }
     }
 
     private long createWindow() {
@@ -106,7 +116,6 @@ public class PreLaunch implements PreLaunchEntrypoint {
         }
 
         GLFW.glfwSetWindowCloseCallback(windowID, w -> GLFW.glfwSetWindowShouldClose(w, false));
-        windowRef.set(windowID);
 
         GLFWVidMode vidMode = GLFW.glfwGetVideoMode(GLFW.glfwGetPrimaryMonitor());
         if (vidMode != null) {
@@ -121,6 +130,7 @@ public class PreLaunch implements PreLaunchEntrypoint {
     }
 
     private void initGL(long windowID) {
+        // get context on render thread
         GLFW.glfwMakeContextCurrent(windowID);
         GL.createCapabilities();
         GLFW.glfwSwapInterval(1);
@@ -130,6 +140,11 @@ public class PreLaunch implements PreLaunchEntrypoint {
         GL11.glOrtho(0, WINDOW_WIDTH, WINDOW_HEIGHT, 0, -1, 1);
         GL11.glMatrixMode(GL11.GL_MODELVIEW);
         GL11.glLoadIdentity();
+
+        loadFont();
+        initTextObjects();
+
+        GLFW.glfwMakeContextCurrent(0); // release context back to MC
     }
 
     private void loadFont() {
@@ -140,71 +155,113 @@ public class PreLaunch implements PreLaunchEntrypoint {
         }
     }
 
-    private void renderLoop(long windowID) {
-        int frame = 0;
-        int y0 = 250 + 10;
-        int detailedStatusFrame = -1;
-
-        final MinecraftBitmapFont.Text memoryText = font.new Text();
-        final float[] memoryUsed = new float[1];
-        final Runtime runtime = Runtime.getRuntime();
-        final long maxMemory = runtime.maxMemory();
+    private void initTextObjects() {
+        runtime = Runtime.getRuntime();
+        maxMemory = runtime.maxMemory();
+        memoryText = font.new Text();
 
         currentStatus = font.new Text("Launching minecraft");
         detailedStatus = font.new Text("Loading");
 
-        Runnable memoryTask = () -> {
-            long totalMemory = runtime.totalMemory();
-            long usedMemory = totalMemory - runtime.freeMemory();
-            memoryUsed[0] = (float) usedMemory / maxMemory;
-            memoryText.update(String.format(
-                    "Memory: %d/%dMB (%.1f%%)",
-                    usedMemory / 1048576L,
-                    maxMemory / 1048576L,
-                    memoryUsed[0] * 100f
-            ));
-        };
-        memoryTask.run();
-        scheduler.scheduleAtFixedRate(memoryTask, 500, 500, TimeUnit.MILLISECONDS);
+        final String minecraftVersion = FabricLoader.getInstance()
+                .getModContainer("minecraft")
+                .map(container -> container.getMetadata().getVersion().getFriendlyString())
+                .orElse("Unknown");
+        final String fabricVersion = FabricLoader.getInstance()
+                .getModContainer("fabricloader")
+                .map(container -> container.getMetadata().getVersion().getFriendlyString())
+                .orElse("Unknown");
 
-		final String minecraftVersion = FabricLoader.getInstance().getModContainer("minecraft").map(container -> container.getMetadata().getVersion().getFriendlyString()).orElse("Unknown");
-		final String fabricVersion = FabricLoader.getInstance().getModContainer("fabricloader").map(container -> container.getMetadata().getVersion().getFriendlyString()).orElse("Unknown");
+        versionInfoText = font.new Text(minecraftVersion + "-" + fabricVersion);
+        fabricVersionInfoText = font.new Text("Fabric loading " + fabricVersion);
 
-		final MinecraftBitmapFont.Text versionInfoText = font.new Text(minecraftVersion + "-" + fabricVersion);
-		final MinecraftBitmapFont.Text fabricVersionInfoText = font.new Text("Fabric loading " + fabricVersion);
+        resourcesInitialized = true;
+    }
 
-        running = true;
-        while (running && !GLFW.glfwWindowShouldClose(windowID)) {
-            GLFW.glfwPollEvents();
-            background(BACKGROUND_COLOR);
+    private static void updateMemory() {
+        if (memoryText == null) return;
+        long totalMemory = runtime.totalMemory();
+        long usedMemory = totalMemory - runtime.freeMemory();
+        memoryUsed[0] = (float) usedMemory / maxMemory;
+        memoryText.update(String.format(
+                "Memory: %d/%dMB (%.1f%%)",
+                usedMemory / 1048576L,
+                maxMemory / 1048576L,
+                memoryUsed[0] * 100f
+        ));
+    }
 
-            frame++;
+    private static final long MINFRAMETIME = TimeUnit.MILLISECONDS.toNanos(10);
+    private static long nextFrameTime = 0;
 
-            int x0 = (WINDOW_WIDTH - BAR_WIDTH) / 2;
-            int gap = (int) ((currentStatus.height() + MinecraftBitmapFont.lineGap) * SCALE);
-            int y1 = y0 + gap;
-            int y2 = y1 + BAR_SPACING;
-            int y3 = y2 + gap;
+    private void renderThreadFunc(long windowID) {
+        // limit frame rate. i'm considering the tradeoff between high fps and cpu usage, not sure if high fps would change much
+        long nt = System.nanoTime();
+        if (nt < nextFrameTime) {
+            return;
+        }
+        nextFrameTime = nt + MINFRAMETIME;
 
-            float[] color = computeMemoryBarColor(memoryUsed[0]);
-            memoryText.render(WINDOW_WIDTH / 2 - memoryText.width() * SCALE / 2, 10 * SCALE + 18, SCALE);
-            drawProgressBar(x0, 10, BAR_WIDTH, BAR_HEIGHT, memoryUsed[0], color);
+        if (!renderLock.tryAcquire()) {
+            return;
+        }
 
-            currentStatus.render(x0, y0, SCALE);
-            drawProgressBar(x0, y1, BAR_WIDTH, BAR_HEIGHT, frame);
+        try {
+            GLFW.glfwMakeContextCurrent(windowID); // get context
 
-			fabricVersionInfoText.render(10, WINDOW_HEIGHT - 8 * SCALE - 13, SCALE);
-			versionInfoText.render(WINDOW_WIDTH - versionInfoText.width() * SCALE - 10, WINDOW_HEIGHT - 8 * SCALE - 13, SCALE);
+            GL11.glViewport(0, 0, WINDOW_WIDTH, WINDOW_HEIGHT);
 
-            if (showDetailedStatus) {
-                if (detailedStatusFrame == -1) detailedStatusFrame = frame;
-                detailedStatus.render(x0, y2, SCALE);
-                drawProgressBar(x0, y3, BAR_WIDTH, BAR_HEIGHT, frame - detailedStatusFrame);
-            } else {
-                detailedStatusFrame = -1;
-            }
+            background(BACKGROUND_COLOR); // draws over the frame, not behind it intuitively. essentially clears the frame.
+            renderFrame();
 
             GLFW.glfwSwapBuffers(windowID);
+
+            GLFW.glfwMakeContextCurrent(0);
+
+            frame++;
+        } catch (Throwable t) {
+            LOGGER.error("Error during rendering", t);
+        } finally {
+            renderLock.release();
+        }
+    }
+
+    private void renderFrame() {
+        if (font == null || currentStatus == null) return;
+
+        int x0 = (WINDOW_WIDTH - BAR_WIDTH) / 2;
+        int y0 = 250 + 10;
+        int gap = (int) ((currentStatus.height() + MinecraftBitmapFont.lineGap) * SCALE);
+        int y1 = y0 + gap;
+        int y2 = y1 + BAR_SPACING;
+        int y3 = y2 + gap;
+
+        // mem bar
+        float[] color = computeMemoryBarColor(memoryUsed[0]);
+        memoryText.render(WINDOW_WIDTH / 2 - memoryText.width() * SCALE / 2, 10 * SCALE + 18, SCALE);
+        drawProgressBar(x0, 10, BAR_WIDTH, BAR_HEIGHT, memoryUsed[0], color);
+
+        // status bar
+        currentStatus.render(x0, y0, SCALE);
+        drawProgressBar(x0, y1, BAR_WIDTH, BAR_HEIGHT, frame);
+
+        // version info
+        fabricVersionInfoText.render(10, WINDOW_HEIGHT - 8 * SCALE - 13, SCALE);
+        versionInfoText.render(WINDOW_WIDTH - versionInfoText.width() * SCALE - 10, WINDOW_HEIGHT - 8 * SCALE - 13, SCALE);
+
+        // detailed status if enabled
+        if (showDetailedStatus) {
+            if (detailedStatusFrame == -1) detailedStatusFrame = frame;
+            detailedStatus.render(x0, y2, SCALE);
+            drawProgressBar(x0, y3, BAR_WIDTH, BAR_HEIGHT, frame - detailedStatusFrame);
+        } else {
+            detailedStatusFrame = -1;
+        }
+    }
+
+    public static void periodicTick() {
+        if (running) {
+            GLFW.glfwPollEvents();
         }
     }
 
@@ -230,96 +287,96 @@ public class PreLaunch implements PreLaunchEntrypoint {
         return new float[]{r, g, b, 1f};
     }
 
-	private void drawProgressBar(int x, int y, int width, int height, float progress, Color color) {
-		int inset = SCALE;
-		width = width + 4 * inset;
-		int filledWidth = (int)(progress * (width - 2 * inset));
+    private void drawProgressBar(int x, int y, int width, int height, float progress, Color color) {
+        int inset = SCALE;
+        width = width + 4 * inset;
+        int filledWidth = (int)(progress * (width - 2 * inset));
 
-		// Outer border (foreground)
-		color(FOREGROUND_COLOR);
-		drawBox(x, y, width, height);
+        // Outer border (foreground)
+        color(FOREGROUND_COLOR);
+        drawBox(x, y, width, height);
 
-		// Inner background
-		color(BACKGROUND_COLOR);
-		drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
+        // Inner background
+        color(BACKGROUND_COLOR);
+        drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
 
-		// Progress fill with dynamic color
-		color(color);
-		drawBox(x + inset * 2, y + inset * 2, filledWidth, height - inset * 4);
-	}
+        // Progress fill with dynamic color
+        color(color);
+        drawBox(x + inset * 2, y + inset * 2, filledWidth, height - inset * 4);
+    }
 
-	private void drawProgressBar(int x, int y, int width, int height, float progress, float[] color) {
-		int inset = SCALE;
-		width = width + 4 * inset;
-		int filledWidth = (int)(progress * (width - 2 * inset));
+    private void drawProgressBar(int x, int y, int width, int height, float progress, float[] color) {
+        int inset = SCALE;
+        width = width + 4 * inset;
+        int filledWidth = (int)(progress * (width - 2 * inset));
 
-		// Outer border (foreground)
-		color(FOREGROUND_COLOR);
-		drawBox(x, y, width, height);
+        // Outer border (foreground)
+        color(FOREGROUND_COLOR);
+        drawBox(x, y, width, height);
 
-		// Inner background
-		color(BACKGROUND_COLOR);
-		drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
+        // Inner background
+        color(BACKGROUND_COLOR);
+        drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
 
-		// Progress fill with dynamic color
-		color(color);
-		drawBox(x + inset * 2, y + inset * 2, filledWidth, height - inset * 4);
-	}
+        // Progress fill with dynamic color
+        color(color);
+        drawBox(x + inset * 2, y + inset * 2, filledWidth, height - inset * 4);
+    }
 
-	private void drawProgressBar(int x, int y, int width, int height, float progress) {
-		drawProgressBar(x, y, width, height, progress, FOREGROUND_COLOR);
-	}
+    private void drawProgressBar(int x, int y, int width, int height, float progress) {
+        drawProgressBar(x, y, width, height, progress, FOREGROUND_COLOR);
+    }
 
-	private void drawProgressBar(int x, int y, int width, int height, int frame, Color color) {
-		int inset = SCALE;
-		width = width + 4 * inset;
-		int maxFilledWidth = width - 2 * inset;
-		float clampedProgress = frame % maxFilledWidth;
+    private void drawProgressBar(int x, int y, int width, int height, int frame, Color color) {
+        int inset = SCALE;
+        width = width + 4 * inset;
+        int maxFilledWidth = width - 2 * inset;
+        float clampedProgress = (frame * 4) % maxFilledWidth;
 
-		// Outer border (foreground)
-		color(FOREGROUND_COLOR);
-		drawBox(x, y, width, height);
+        // Outer border (foreground)
+        color(FOREGROUND_COLOR);
+        drawBox(x, y, width, height);
 
-		// Inner background
-		color(BACKGROUND_COLOR);
-		drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
+        // Inner background
+        color(BACKGROUND_COLOR);
+        drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
 
-		// Progress fill
-		color(color);
-		if (clampedProgress + 16 > maxFilledWidth - inset * 2) {
-			drawBox(x + inset * 2, y + inset * 2, 16 - ((maxFilledWidth - inset * 2) - clampedProgress), height - inset * 4);
-			drawBox(x + inset * 2 + clampedProgress, y + inset * 2, (maxFilledWidth - inset * 2) - clampedProgress, height - inset * 4);
-		} else {
-			drawBox(x + inset * 2 + clampedProgress, y + inset * 2, 16, height - inset * 4);
-		}
-	}
-	private void drawProgressBar(int x, int y, int width, int height, int frame, float[] color) {
-		int inset = SCALE;
-		width = width + 4 * inset;
-		int maxFilledWidth = width - 2 * inset;
-		float clampedProgress = frame % maxFilledWidth;
+        // Progress fill
+        color(color);
+        if (clampedProgress + 16 > maxFilledWidth - inset * 2) {
+            drawBox(x + inset * 2, y + inset * 2, 16 - ((maxFilledWidth - inset * 2) - clampedProgress), height - inset * 4);
+            drawBox(x + inset * 2 + clampedProgress, y + inset * 2, (maxFilledWidth - inset * 2) - clampedProgress, height - inset * 4);
+        } else {
+            drawBox(x + inset * 2 + clampedProgress, y + inset * 2, 16, height - inset * 4);
+        }
+    }
+    private void drawProgressBar(int x, int y, int width, int height, int frame, float[] color) {
+        int inset = SCALE;
+        width = width + 4 * inset;
+        int maxFilledWidth = width - 2 * inset;
+        float clampedProgress = (frame * 4) % maxFilledWidth;
 
-		// Outer border (foreground)
-		color(FOREGROUND_COLOR);
-		drawBox(x, y, width, height);
+        // Outer border (foreground)
+        color(FOREGROUND_COLOR);
+        drawBox(x, y, width, height);
 
-		// Inner background
-		color(BACKGROUND_COLOR);
-		drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
+        // Inner background
+        color(BACKGROUND_COLOR);
+        drawBox(x + inset, y + inset, width - 2 * inset, height - 2 * inset);
 
-		// Progress fill
-		color(color);
-		if (clampedProgress + 16 > maxFilledWidth - inset * 2) {
-			drawBox(x + inset * 2, y + inset * 2, 16 - ((maxFilledWidth - inset * 2) - clampedProgress), height - inset * 4);
-			drawBox(x + inset * 2 + clampedProgress, y + inset * 2, (maxFilledWidth - inset * 2) - clampedProgress, height - inset * 4);
-		} else {
-			drawBox(x + inset * 2 + clampedProgress, y + inset * 2, 16, height - inset * 4);
-		}
-	}
+        // Progress fill
+        color(color);
+        if (clampedProgress + 16 > maxFilledWidth - inset * 2) {
+            drawBox(x + inset * 2, y + inset * 2, 16 - ((maxFilledWidth - inset * 2) - clampedProgress), height - inset * 4);
+            drawBox(x + inset * 2 + clampedProgress, y + inset * 2, (maxFilledWidth - inset * 2) - clampedProgress, height - inset * 4);
+        } else {
+            drawBox(x + inset * 2 + clampedProgress, y + inset * 2, 16, height - inset * 4);
+        }
+    }
 
-	private void drawProgressBar(int x, int y, int width, int height, int frame) {
-		drawProgressBar(x, y, width, height, frame, FOREGROUND_COLOR);
-	}
+    private void drawProgressBar(int x, int y, int width, int height, int frame) {
+        drawProgressBar(x, y, width, height, frame, FOREGROUND_COLOR);
+    }
 
     private static void drawBox(float x, float y, float width, float height) {
         GL11.glBegin(GL11.GL_QUADS);
@@ -345,38 +402,53 @@ public class PreLaunch implements PreLaunchEntrypoint {
 
     public static void close() {
         running = false;
-        tryJoin(glfwThread);
-        tryJoin(renderThread);
-        disposeResources();
-    }
 
-    private static void tryJoin(Thread t) {
-        if (t != null) {
-            try {
-                t.join(1000);
-            } catch (InterruptedException ignored) {
+        if (renderScheduler != null) {
+            // submit disposal task to render thread BEFORE canceling ticker
+            renderScheduler.submit(() -> {
+                try {
+                    renderLock.acquire();
+                    Long windowID = windowRef.get();
+                    if (windowID != null) {
+                        GLFW.glfwMakeContextCurrent(windowID);
+                        disposeResources();
+                        GLFW.glfwMakeContextCurrent(0);
+                    }
+                } catch (Exception e) {
+                    LOGGER.warn("Error disposing loading screen resources", e);
+                } finally {
+                    renderLock.release();
+                }
+            });
+
+            if (renderTick != null) {
+                renderTick.cancel(false);
             }
+
+            renderScheduler.shutdown();
+            try {
+                renderScheduler.awaitTermination(1, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                renderScheduler.shutdownNow();
+            }
+        }
+
+        // just destroy the window, don't try to use its context
+        Long windowID = windowRef.get();
+        if (windowID != null) {
+            GLFW.glfwDestroyWindow(windowID);
+            windowRef.set(null);
         }
     }
 
     private static void disposeResources() {
-        try {
-            Long w = windowRef.get();
-            if (w != null) {
-                GLFW.glfwMakeContextCurrent(w);
-                disposeFont();
-                GLFW.glfwDestroyWindow(w);
-                windowRef.set(null);
-            }
-        } catch (Exception e) {
-            LOGGER.warn("Error disposing loading screen resources", e);
-        } finally {
-            GLFW.glfwMakeContextCurrent(0);
-            font = null;
-            currentStatus = null;
-            detailedStatus = null;
-            scheduler.shutdownNow();
-        }
+        disposeFont();
+        font = null;
+        currentStatus = null;
+        detailedStatus = null;
+        memoryText = null;
+        versionInfoText = null;
+        fabricVersionInfoText = null;
     }
 
     private static void disposeFont() {
@@ -385,8 +457,6 @@ public class PreLaunch implements PreLaunchEntrypoint {
                 font.dispose();
             } catch (Exception e) {
                 LOGGER.warn("Failed to dispose font", e);
-            } finally {
-                font = null;
             }
         }
     }
@@ -395,14 +465,10 @@ public class PreLaunch implements PreLaunchEntrypoint {
         Long windowID = windowRef.get();
         if (windowID == null) return;
 
-        GLFW.glfwMakeContextCurrent(windowID);
-        disposeFont();
+        disposeResources();
         GLFW.glfwDestroyWindow(windowID);
-        GLFW.glfwMakeContextCurrent(0);
+        GLFW.glfwTerminate();
+        GLFW.glfwSetErrorCallback(null).free();
         windowRef.set(null);
-    }
-
-    private static boolean isMac() {
-        return System.getProperty("os.name").toLowerCase().contains("mac");
     }
 }
